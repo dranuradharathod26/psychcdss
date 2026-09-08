@@ -1,0 +1,714 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Psychiatric OPD — Assessment Support</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; font-size: 14px; color: #171A1E; }
+  button { font-family: inherit; cursor: pointer; }
+  input, textarea { font-family: inherit; }
+  input[type="text"]:focus, textarea:focus { outline: 2px solid #0E6B66; outline-offset: -1px; }
+  .spin { animation: spin 0.8s linear infinite; display: inline-block; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef, useEffect } = React;
+
+// ---------- palette ----------
+const ink = "#171A1E";
+const paper = "#EFF1F2";
+const panel = "#FFFFFF";
+const line = "#DADFE2";
+const sidebar = "#14181D";
+const sidebarLine = "#262C33";
+const accent = "#0E6B66";
+const critical = "#B3392A";
+const moderate = "#96660C";
+
+const MODEL = "claude-sonnet-4-6";
+
+// ---------- question bank (priority: 0=safety-critical, 1=diagnosis-changing, 2=treatment-changing) ----------
+
+const BACKBONE = [
+  { id: "chiefComplaint", p: 1, label: "Chief complaint", type: "text", ph: "In the patient's words" },
+  { id: "onset", p: 1, label: "Onset", type: "chip", opts: ["<2 weeks", "2–4 weeks", "1–3 months", ">3 months", "Chronic/recurrent"] },
+  { id: "course", p: 1, label: "Course", type: "chip", opts: ["Episodic", "Persistent", "Fluctuating"] },
+  { id: "sleepScreen", p: 1, label: "Sleep", type: "chip", opts: ["Normal", "Insomnia", "Hypersomnia", "Reduced need for sleep", "Not assessed"] },
+  { id: "backboneBipolarScreen", p: 0, label: "Past periods of elevated mood/energy lasting ≥4 days", type: "chip", opts: ["Yes", "No", "Unclear"], showIf: (a) => a.sleepScreen === "Reduced need for sleep" },
+  { id: "appetiteScreen", p: 1, label: "Appetite/weight", type: "chip", opts: ["Normal", "Decreased", "Increased", "Significant weight change", "Not assessed"] },
+  { id: "currentSI", p: 0, label: "Current suicidal ideation", type: "chip", opts: ["None", "Passive", "Active, no plan", "Active, with plan"] },
+  { id: "recentSelfHarm", p: 0, label: "Self-harm or suicide attempt in last 3 months", type: "chip", opts: ["Yes", "No"] },
+  { id: "accessToMeans", p: 0, label: "Access to means (medication, weapons, etc.)", type: "chip", opts: ["Yes", "Limited", "No"] },
+  { id: "comorbidity", p: 1, label: "Psychiatric comorbidity screen", type: "multichip", opts: ["Anxiety", "Substance use", "Psychotic symptoms", "None reported"] },
+  { id: "substanceUse", p: 1, label: "Current substance use", type: "chip", opts: ["Yes", "No"] },
+  { id: "medicalContributor", p: 1, label: "Relevant medical/neurological illness or medication effect", type: "text", ph: "Or 'none identified'" },
+  { id: "currentMeds", p: 2, label: "Current psychiatric medications", type: "text", ph: "Drug, dose, duration — or 'none'" },
+  { id: "pastPsychHx", p: 1, label: "Past psychiatric history", type: "text", ph: "Episodes, admissions, treatments, response — or 'none'" },
+  { id: "familyHx", p: 2, label: "Family psychiatric history", type: "chip", opts: ["Yes", "No", "Unknown"] },
+  { id: "psychosocial", p: 2, label: "Psychosocial stressors", type: "multichip", opts: ["Relationship", "Financial", "Occupational", "Bereavement/loss", "None identified"] },
+];
+
+const SELFHARM = [
+  { id: "shMethod", p: 0, label: "Method/behaviour", type: "text", ph: "Exactly what was done" },
+  { id: "shTiming", p: 0, label: "Timing", type: "chip", opts: ["<24 hours", "1–7 days", "1–4 weeks", "1–3 months"] },
+  { id: "shSubstanceInvolved", p: 0, label: "Medication/substance ingestion involved", type: "chip", opts: ["Yes", "No"] },
+  { id: "odWhat", p: 0, label: "Medication and approximate quantity", type: "text", ph: "Name, strength, number of tablets", showIf: (a) => a.shSubstanceInvolved === "Yes" },
+  { id: "odOwnMed", p: 0, label: "Was this the patient's own psychiatric medication", type: "chip", opts: ["Yes", "No"], showIf: (a) => a.shSubstanceInvolved === "Yes" },
+  { id: "odMedicalAssessed", p: 0, label: "Medical assessment already completed", type: "chip", opts: ["Yes", "No", "In progress"], showIf: (a) => a.shSubstanceInvolved === "Yes" },
+  { id: "shIntent", p: 0, label: "Intent at the time", type: "chip", opts: ["Wish to die", "Ambivalent", "No intent to die", "Unclear"] },
+  { id: "shPlanned", p: 0, label: "Planned or impulsive", type: "chip", opts: ["Planned", "Impulsive", "Mixed"] },
+  { id: "shCurrentPlan", p: 0, label: "Current suicidal plan", type: "chip", opts: ["Yes", "No"] },
+  { id: "shPrevAttempts", p: 1, label: "Previous attempts or NSSI", type: "chip", opts: ["Yes", "No"] },
+  { id: "shAgitation", p: 1, label: "Current psychosis, mania, or marked agitation", type: "chip", opts: ["Yes", "No"] },
+  { id: "shProtective", p: 1, label: "Protective factors present", type: "multichip", opts: ["Family support", "Future orientation", "Religious/moral objection", "None identified"] },
+  { id: "shCollaborate", p: 1, label: "Able to collaborate with safety planning", type: "chip", opts: ["Yes", "Uncertain", "No"] },
+  { id: "shFollowUp", p: 1, label: "Reliable outpatient follow-up available", type: "chip", opts: ["Yes", "Uncertain", "No"] },
+];
+
+const DEPRESSION = [
+  { id: "coreSymptoms", p: 1, label: "Core symptoms present", type: "multichip", opts: ["Depressed mood", "Anhedonia", "Low energy", "Sleep change", "Appetite/weight change", "Psychomotor change", "Poor concentration", "Guilt/worthlessness", "Hopelessness"] },
+  { id: "episodeType", p: 1, label: "First episode or recurrent", type: "chip", opts: ["First episode", "Recurrent"] },
+  { id: "sleepPattern", p: 1, label: "Sleep pattern", type: "chip", opts: ["Insomnia with fatigue", "Reduced need for sleep, energy preserved/increased", "Hypersomnia", "No significant change"] },
+  { id: "bipolarEpisodes", p: 0, label: "Past periods of elevated mood/energy lasting ≥4 days", type: "chip", opts: ["Yes", "No", "Unclear"], showIf: (a) => a.sleepPattern === "Reduced need for sleep, energy preserved/increased" },
+  { id: "bipolarRiskyBehaviour", p: 1, label: "Increased goal-directed activity or risky behaviour during those periods", type: "chip", opts: ["Yes", "No"], showIf: (a) => a.sleepPattern === "Reduced need for sleep, energy preserved/increased" && a.bipolarEpisodes === "Yes" },
+  { id: "psychoticFeatures", p: 0, label: "Psychotic features (delusions/hallucinations)", type: "chip", opts: ["Yes", "No"] },
+  { id: "griefContext", p: 1, label: "Recent bereavement or loss context", type: "chip", opts: ["Yes", "No"] },
+  { id: "adEpisodeType", p: 2, label: "Adjustment reaction vs. autonomous depressive episode", type: "chip", opts: ["Adjustment-type", "Autonomous", "Unclear"] },
+  { id: "adTrials", p: 2, label: "Previous antidepressant trials", type: "text", ph: "Agent, dose, duration, response — or 'none'" },
+];
+
+const PERSONALITY = [
+  { id: "persPatternOnset", p: 1, label: "Pattern onset", type: "chip", opts: ["Early adulthood, longstanding", "Recent, since current episode", "Unclear"] },
+  { id: "persEpisodeVsTrait", p: 1, label: "Instability confined to the current mood episode, or a longstanding trait pattern predating it", type: "chip", opts: ["Confined to current episode", "Longstanding pattern predating episode", "Unclear"] },
+  { id: "persPervasiveness", p: 1, label: "Pattern pervasive across relationships/contexts, not situation-specific", type: "chip", opts: ["Yes", "No", "Unclear"] },
+  { id: "persTraits", p: 1, label: "Traits reported (mark only what is genuinely longstanding, not just present now)", type: "multichip", opts: ["Marked mood reactivity to interpersonal events", "Chronic emptiness", "Intense/poorly controlled anger", "Identity disturbance", "Unstable/intense relationship pattern", "Impulsivity in ≥2 areas", "Recurrent self-harm as a pattern", "Frantic efforts to avoid abandonment", "Transient paranoid/dissociative symptoms under stress", "Grandiosity/need for admiration", "Limited empathy pattern", "Disregard for others' rights/deceit pattern", "None of these — appears reactive to current stressor only"] },
+  { id: "persSelfHarmFunction", p: 1, label: "Function of self-harm, if present", type: "chip", opts: ["Emotion-regulation/communicative pattern", "Primarily a symptom of the current depressive episode", "Unclear", "Not applicable"] },
+  { id: "persFunctionalImpact", p: 2, label: "Functional impact", type: "multichip", opts: ["Relationships", "Occupational", "Self-image/identity"] },
+  { id: "persDevelopmentalContext", p: 2, label: "Reported developmental adversity (neglect, instability, abuse)", type: "chip", opts: ["Yes", "No", "Not disclosed"] },
+  { id: "persCurrentStressor", p: 2, label: "Identifiable current interpersonal stressor", type: "text", ph: "Or none" },
+];
+
+const ANXIETY = [
+  { id: "anxPhenotype", p: 1, label: "Main anxiety phenotype", type: "chip", opts: ["Panic attacks", "Generalized worry", "Social/performance anxiety", "Specific phobia", "Obsessions/compulsions", "Trauma-related", "Illness anxiety"] },
+  { id: "anxPanicFreq", p: 1, label: "Panic attack frequency", type: "chip", opts: ["Multiple/week", "Weekly", "Monthly", "Rare"], showIf: (a) => a.anxPhenotype === "Panic attacks" },
+  { id: "anxAnticipatory", p: 1, label: "Anticipatory anxiety between attacks", type: "chip", opts: ["Yes", "No"], showIf: (a) => a.anxPhenotype === "Panic attacks" },
+  { id: "anxAgoraphobia", p: 2, label: "Avoidance of situations/agoraphobia", type: "chip", opts: ["Yes", "No"], showIf: (a) => a.anxPhenotype === "Panic attacks" },
+  { id: "anxWorryDuration", p: 1, label: "Worry duration", type: "chip", opts: ["<6 months", "≥6 months"], showIf: (a) => a.anxPhenotype === "Generalized worry" },
+  { id: "anxWorryDomains", p: 2, label: "Worry domains", type: "multichip", opts: ["Health", "Finances", "Work/academics", "Relationships", "Multiple/diffuse"], showIf: (a) => a.anxPhenotype === "Generalized worry" },
+  { id: "anxWorryControl", p: 1, label: "Worry felt controllable", type: "chip", opts: ["Yes", "No"], showIf: (a) => a.anxPhenotype === "Generalized worry" },
+  { id: "anxOCDFlag", p: 0, label: "Obsessions/compulsions present", type: "chip", opts: ["Yes", "No"], showIf: (a) => a.anxPhenotype === "Obsessions/compulsions" },
+  { id: "anxTraumaFlag", p: 0, label: "Identifiable traumatic event linked to onset", type: "chip", opts: ["Yes", "No"], showIf: (a) => a.anxPhenotype === "Trauma-related" },
+  { id: "anxDepressionComorbid", p: 1, label: "Comorbid depressive symptoms", type: "chip", opts: ["Yes", "No"] },
+  { id: "anxSubstanceCaffeine", p: 1, label: "Caffeine/stimulant/substance contribution", type: "chip", opts: ["Yes", "No", "Unclear"] },
+  { id: "anxFunctionalImpact", p: 2, label: "Functional impairment", type: "multichip", opts: ["Work/academic", "Social", "Relationships", "Avoidance-driven restriction"] },
+  { id: "anxPrevTreatment", p: 2, label: "Previous treatment and response", type: "text", ph: "Medication/therapy tried, response — or none" },
+];
+
+const SLEEP = [
+  { id: "sleepComplaintType", p: 1, label: "Primary sleep complaint", type: "chip", opts: ["Insomnia", "Circadian rhythm problem", "Hypersomnolence", "Sleep-disordered breathing suspected", "Restless legs", "Parasomnia"] },
+  { id: "sleepInitMaintain", p: 1, label: "Pattern", type: "multichip", opts: ["Difficulty falling asleep", "Difficulty staying asleep", "Early morning waking", "Non-restorative sleep"] },
+  { id: "sleepReducedNeed", p: 0, label: "Reduced need for sleep with preserved/increased energy, vs. fatigued insomnia", type: "chip", opts: ["Reduced need for sleep", "Fatigued insomnia", "Neither"] },
+  { id: "sleepBipolarEpisodes", p: 0, label: "Past periods of elevated mood/energy lasting ≥4 days", type: "chip", opts: ["Yes", "No", "Unclear"], showIf: (a) => a.sleepReducedNeed === "Reduced need for sleep" },
+  { id: "sleepSchedule", p: 2, label: "Schedule regularity", type: "chip", opts: ["Regular", "Variable/shift-based", "Delayed phase", "Advanced phase"] },
+  { id: "sleepDaytimeSleepiness", p: 1, label: "Daytime sleepiness", type: "chip", opts: ["Yes", "No"] },
+  { id: "sleepSubstances", p: 1, label: "Caffeine/nicotine/alcohol/drug use affecting sleep", type: "multichip", opts: ["Caffeine", "Nicotine", "Alcohol", "Other drugs", "None identified"] },
+  { id: "sleepHypnotics", p: 2, label: "Current hypnotics/sedatives", type: "text", ph: "Drug, dose, duration — or none" },
+  { id: "sleepApnoeaSigns", p: 1, label: "Snoring, witnessed apnoea, or gasping", type: "chip", opts: ["Yes", "No", "Unknown"] },
+  { id: "sleepRestlessLegs", p: 2, label: "Restless legs / periodic limb movements", type: "chip", opts: ["Yes", "No"] },
+  { id: "sleepFunctionalImpact", p: 2, label: "Functional consequence", type: "text", ph: "Work, driving safety, mood, concentration" },
+];
+
+const ADDICTION = [
+  { id: "addPrimarySubstance", p: 1, label: "Primary substance of concern", type: "chip", opts: ["Alcohol", "Opioids", "Cannabis", "Benzodiazepines", "Stimulants", "Tobacco/Nicotine", "Other"] },
+  { id: "addRoute", p: 2, label: "Route", type: "chip", opts: ["Oral", "Smoked", "Inhaled", "Injected", "Other"] },
+  { id: "addQuantityFreq", p: 1, label: "Current quantity and frequency", type: "text", ph: "e.g. amount per day/week" },
+  { id: "addEscalation", p: 1, label: "Pattern over time", type: "chip", opts: ["Escalating", "Stable", "Fluctuating", "Recently reduced/stopped"] },
+  { id: "addLastUse", p: 1, label: "Last use", type: "chip", opts: ["<24 hours", "1–3 days", "4–7 days", ">1 week"] },
+  { id: "addCravingControl", p: 1, label: "Craving / loss of control over use", type: "chip", opts: ["Yes", "No"] },
+  { id: "addToleranceWithdrawal", p: 0, label: "Tolerance or withdrawal symptoms", type: "multichip", opts: ["Tolerance", "Withdrawal symptoms", "Neither"] },
+  { id: "addFailedAttempts", p: 2, label: "Failed attempts to cut down/stop", type: "chip", opts: ["Yes", "No"] },
+  { id: "addFunctionalConsequences", p: 1, label: "Consequences", type: "multichip", opts: ["Occupational", "Relationship/family", "Financial/legal", "Physical health"] },
+  { id: "addOverdoseHistory", p: 0, label: "Overdose history", type: "chip", opts: ["Yes", "No"] },
+  { id: "addOtherSubstances", p: 2, label: "Other substances used", type: "text", ph: "Or none" },
+  { id: "addWithdrawalRisk", p: 0, label: "Risk of medically significant withdrawal (esp. heavy alcohol/benzodiazepine use)", type: "chip", opts: ["Yes", "No", "Unclear"] },
+  { id: "addPrevTreatment", p: 2, label: "Previous detox/rehabilitation/pharmacological treatment", type: "text", ph: "Or none" },
+];
+
+const ADHD = [
+  { id: "adhdPresentation", p: 1, label: "Presentation type", type: "chip", opts: ["Predominantly inattentive", "Predominantly hyperactive-impulsive", "Combined"] },
+  { id: "adhdChildhoodOnset", p: 1, label: "Symptoms present before age 12", type: "chip", opts: ["Yes", "No", "Uncertain"] },
+  { id: "adhdCorroboration", p: 1, label: "Corroborating history available (school reports, family/partner account)", type: "chip", opts: ["Yes", "No"] },
+  { id: "adhdPervasiveness", p: 1, label: "Present across ≥2 settings (work/home/relationships)", type: "chip", opts: ["Yes", "No"] },
+  { id: "adhdInattentive", p: 1, label: "Inattentive symptoms", type: "multichip", opts: ["Sustained attention difficulty", "Careless errors", "Disorganization", "Losing things", "Distractibility", "Forgetfulness"] },
+  { id: "adhdHyperactive", p: 1, label: "Hyperactive/impulsive symptoms", type: "multichip", opts: ["Inner/outer restlessness", "Difficulty waiting turn", "Interrupting", "Impulsive decisions", "Excess talkativeness"] },
+  { id: "adhdFunctionalImpact", p: 2, label: "Functional impact", type: "multichip", opts: ["Occupational/academic", "Financial", "Relational", "Driving/safety"] },
+  { id: "adhdDifferential", p: 1, label: "Possible contributors to screen out", type: "multichip", opts: ["Anxiety", "Depression", "Bipolar spectrum", "Sleep disorder", "Substance use", "Trauma", "None identified"] },
+  { id: "adhdConsideringStimulant", p: 1, label: "Considering stimulant treatment", type: "chip", opts: ["Yes", "No"] },
+  { id: "adhdCardiacHx", p: 0, label: "Personal/family history of cardiac disease or sudden death", type: "chip", opts: ["Yes", "No"], showIf: (a) => a.adhdConsideringStimulant === "Yes" },
+  { id: "adhdBPBaseline", p: 0, label: "Baseline BP/pulse recorded", type: "chip", opts: ["Yes", "No"], showIf: (a) => a.adhdConsideringStimulant === "Yes" },
+  { id: "adhdMisuseRisk", p: 0, label: "Substance use disorder history or diversion/misuse risk signs", type: "chip", opts: ["Yes", "No"], showIf: (a) => a.adhdConsideringStimulant === "Yes" },
+  { id: "adhdBipolarPsychosisHx", p: 0, label: "Bipolar or psychotic disorder history", type: "chip", opts: ["Yes", "No"], showIf: (a) => a.adhdConsideringStimulant === "Yes" },
+  { id: "adhdPrevTrials", p: 2, label: "Previous stimulant/non-stimulant trials", type: "text", ph: "Agent, response, adverse effects — or none" },
+];
+
+const EDPME = [
+  { id: "edpmeConcern", p: 1, label: "Presenting concern", type: "multichip", opts: ["Erectile dysfunction", "Premature ejaculation", "Low desire/libido", "Delayed ejaculation", "Other"] },
+  { id: "edpmeOnset", p: 1, label: "Onset", type: "chip", opts: ["Lifelong/primary", "Acquired/secondary"] },
+  { id: "edpmeSituational", p: 1, label: "Situational (only some partners/situations) or generalized (all situations)", type: "chip", opts: ["Situational", "Generalized", "Unclear"] },
+  { id: "edpmeMorningErections", p: 1, label: "Morning/nocturnal erections present", type: "chip", opts: ["Yes", "No", "Unsure"], showIf: (a) => a.edpmeConcern && a.edpmeConcern.includes("Erectile dysfunction") },
+  { id: "edpmeIELT", p: 2, label: "Estimated time to ejaculation", type: "chip", opts: ["<1 min", "1–3 min", "3–7 min", ">7 min", "Variable"], showIf: (a) => a.edpmeConcern && a.edpmeConcern.includes("Premature ejaculation") },
+  { id: "edpmePerceivedControl", p: 2, label: "Perceived control over ejaculation", type: "chip", opts: ["Little/none", "Some", "Adequate"], showIf: (a) => a.edpmeConcern && a.edpmeConcern.includes("Premature ejaculation") },
+  { id: "edpmeDistress", p: 1, label: "Personal or interpersonal distress caused", type: "chip", opts: ["Marked", "Mild", "Minimal"] },
+  { id: "edpmeMedTemporal", p: 1, label: "Onset temporally linked to starting a psychiatric medication (e.g. SSRI/SNRI/antipsychotic)", type: "chip", opts: ["Yes", "No", "Unclear"] },
+  { id: "edpmeVascularRisk", p: 1, label: "Vascular risk factors", type: "multichip", opts: ["Diabetes", "Hypertension", "Smoking", "Dyslipidemia", "Cardiovascular disease", "None identified"] },
+  { id: "edpmeEndocrine", p: 2, label: "Endocrine symptoms suggestive of low testosterone (low libido, fatigue, reduced body hair)", type: "chip", opts: ["Yes", "No"] },
+  { id: "edpmeSubstanceAlcohol", p: 1, label: "Alcohol or substance use contribution", type: "chip", opts: ["Yes", "No", "Unclear"] },
+  { id: "edpmePsychFactors", p: 2, label: "Psychological contributors", type: "multichip", opts: ["Performance anxiety", "Relationship conflict", "Comorbid depression/anxiety", "Guilt/religious or cultural factors", "None identified"] },
+  { id: "edpmePartnerAwareness", p: 2, label: "Partner aware / involved in consultation", type: "chip", opts: ["Yes", "No", "Not applicable"] },
+  { id: "edpmePrevTreatment", p: 2, label: "Previous treatment tried", type: "text", ph: "Medication, therapy, devices — or none" },
+];
+
+const MODULES = {
+  depression: { label: "Depression", questions: DEPRESSION },
+  selfharm: { label: "Depression + self-harm", questions: DEPRESSION },
+  personality: { label: "Personality pattern (Cluster B screen)", questions: PERSONALITY },
+  anxiety: { label: "Anxiety", questions: ANXIETY },
+  sleep: { label: "Sleep", questions: SLEEP },
+  addiction: { label: "Addiction / substance use", questions: ADDICTION },
+  adhd: { label: "ADHD", questions: ADHD },
+  edpme: { label: "Sexual dysfunction (ED / PME)", questions: EDPME },
+};
+
+const PRESENTATIONS = ["depression", "selfharm", "personality", "anxiety", "sleep", "addiction", "adhd", "edpme"];
+
+function visibleQuestions(presentation, answers) {
+  let qs = [...BACKBONE, ...((MODULES[presentation] && MODULES[presentation].questions) || [])];
+  const wantsSelfHarm = presentation === "selfharm" || answers.recentSelfHarm === "Yes";
+  if (wantsSelfHarm) qs = qs.concat(SELFHARM);
+  return qs.filter((q) => !q.showIf || q.showIf(answers));
+}
+
+function computeFlags(answers) {
+  const flags = [];
+  const add = (level, text) => flags.push({ level, text });
+  if (answers.currentSI === "Active, with plan") add("critical", "Active suicidal ideation with a plan");
+  if (answers.recentSelfHarm === "Yes" && (answers.currentSI === "Active, no plan" || answers.currentSI === "Active, with plan"))
+    add("critical", "Recent self-harm with ongoing active ideation");
+  if (answers.shCurrentPlan === "Yes") add("critical", "Current suicidal plan disclosed");
+  if (answers.accessToMeans === "Yes" && (answers.currentSI && answers.currentSI.startsWith("Active") || answers.recentSelfHarm === "Yes"))
+    add("critical", "Access to means with elevated risk");
+  if (answers.odOwnMed === "Yes") add("critical", "Own psychiatric medication used in overdose — review access/supervision before any refill");
+  if (answers.psychoticFeatures === "Yes") add("critical", "Psychotic features present");
+  if (answers.bipolarEpisodes === "Yes" || answers.sleepBipolarEpisodes === "Yes" || answers.backboneBipolarScreen === "Yes")
+    add("moderate", "Possible bipolarity — screen before escalating antidepressant treatment");
+  if (answers.shAgitation === "Yes") add("moderate", "Current agitation/mania/psychosis alongside self-harm history");
+  if (answers.shCollaborate === "No") add("moderate", "Patient unable to collaborate with safety planning");
+  if (answers.shFollowUp === "No") add("moderate", "No reliable follow-up currently available");
+  if (answers.anxOCDFlag === "Yes") add("moderate", "OCD phenomenology present — consider OCD-specific assessment");
+  if (answers.anxTraumaFlag === "Yes") add("moderate", "Trauma-linked onset — consider PTSD-specific assessment");
+  if (answers.addWithdrawalRisk === "Yes") add("critical", "Possible need for medically supervised withdrawal management");
+  if (answers.addOverdoseHistory === "Yes") add("moderate", "History of substance overdose");
+  if (answers.adhdCardiacHx === "Yes") add("critical", "Cardiac history reported — screen before stimulant initiation");
+  if (answers.adhdBipolarPsychosisHx === "Yes") add("critical", "Bipolar/psychotic history — screen before stimulant initiation");
+  if (answers.adhdMisuseRisk === "Yes") add("critical", "Misuse/diversion risk signs — caution before prescribing stimulants");
+  if (answers.persTraits && answers.persTraits.length > 0 && !answers.persTraits.includes("None of these — appears reactive to current stressor only") && answers.persEpisodeVsTrait === "Confined to current episode")
+    add("moderate", "Traits marked but instability appears episode-confined — avoid attributing to a personality disorder without longitudinal history");
+  if (answers.persEpisodeVsTrait === "Longstanding pattern predating episode" && answers.persPervasiveness === "Yes")
+    add("moderate", "Possible longstanding personality pattern — needs corroboration over time, not a single-visit diagnosis");
+  if (answers.edpmeMedTemporal === "Yes") add("moderate", "Possible medication-induced sexual dysfunction — review temporal link before changing psychiatric treatment");
+  if (answers.edpmeConcern && answers.edpmeConcern.includes("Erectile dysfunction") && answers.edpmeMorningErections === "No" && answers.edpmeSituational === "Generalized")
+    add("moderate", "Pattern suggests possible organic contribution — consider medical/vascular workup");
+  if (answers.edpmeVascularRisk && answers.edpmeVascularRisk.length > 0 && !answers.edpmeVascularRisk.includes("None identified"))
+    add("moderate", "Vascular risk factors present — erectile dysfunction can be an early marker of cardiovascular disease");
+  return flags;
+}
+
+function isAnswered(q, answers) {
+  const v = answers[q.id];
+  if (v === undefined || v === null) return false;
+  if (Array.isArray(v)) return v.length > 0;
+  return String(v).trim().length > 0;
+}
+
+function parseDashboard(text) {
+  const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+  const headerRegex = /^[A-Z][A-Z /()'-]*:$/;
+  const sections = [];
+  let current = null;
+  lines.forEach((line) => {
+    if (headerRegex.test(line)) {
+      current = { header: line.replace(/:$/, ""), bullets: [] };
+      sections.push(current);
+    } else {
+      const clean = line.replace(/^[-•]\s*/, "");
+      if (!current) { current = { header: "", bullets: [] }; sections.push(current); }
+      current.bullets.push(clean);
+    }
+  });
+  return sections;
+}
+
+function parseGapCheck(text) {
+  let extracted = {};
+  let gaps = [];
+  const extractedMatch = text.match(/EXTRACTED:\s*([\s\S]*?)(?=STILL ASK:|$)/i);
+  const stillAskMatch = text.match(/STILL ASK:\s*([\s\S]*)/i);
+  if (extractedMatch) { try { extracted = JSON.parse(extractedMatch[1].trim()); } catch (e) { extracted = {}; } }
+  if (stillAskMatch) {
+    gaps = stillAskMatch[1].split("\n").map((l) => l.trim()).filter((l) => l.startsWith("-")).map((l) => l.replace(/^-\s*/, ""));
+  }
+  return { extracted, gaps };
+}
+
+async function callClaude(apiKey, system, userContent) {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 1000,
+      system,
+      messages: [{ role: "user", content: userContent }],
+    }),
+  });
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`API error ${response.status}: ${errText.slice(0, 200)}`);
+  }
+  const data = await response.json();
+  return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+}
+
+function QuestionField({ q, value, onChange }) {
+  if (q.type === "text") {
+    return React.createElement("input", {
+      type: "text", value: value || "", placeholder: q.ph || "",
+      onChange: (e) => onChange(q.id, e.target.value),
+      style: { borderColor: line, width: "100%", border: "1px solid", padding: "8px 12px", fontSize: 14, outline: "none" },
+    });
+  }
+  if (q.type === "chip" || q.type === "multichip") {
+    const isMulti = q.type === "multichip";
+    const arr = isMulti ? (Array.isArray(value) ? value : []) : null;
+    const toggle = (opt) => {
+      if (isMulti) {
+        const next = arr.includes(opt) ? arr.filter((x) => x !== opt) : [...arr, opt];
+        onChange(q.id, next);
+      } else {
+        onChange(q.id, opt);
+      }
+    };
+    return React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 6 } },
+      q.opts.map((opt) => {
+        const selected = isMulti ? arr.includes(opt) : value === opt;
+        return React.createElement("button", {
+          key: opt, onClick: () => toggle(opt),
+          style: { border: "1px solid " + (selected ? accent : line), background: selected ? accent : "transparent", color: selected ? "#fff" : ink, padding: "4px 10px", fontSize: 13 },
+        }, opt);
+      })
+    );
+  }
+  return null;
+}
+
+function App() {
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem("opd_cdss_api_key") || "");
+  const [showKeyInput, setShowKeyInput] = useState(!localStorage.getItem("opd_cdss_api_key"));
+  const [presentation, setPresentation] = useState(null);
+  const [answers, setAnswers] = useState({});
+  const [screen, setScreen] = useState("select");
+  const [mode, setMode] = useState("manual");
+  const [dashboardText, setDashboardText] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const [consentGiven, setConsentGiven] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [elapsed, setElapsed] = useState(0);
+  const [speechSupported, setSpeechSupported] = useState(true);
+  const [speechError, setSpeechError] = useState("");
+  const [gapLoading, setGapLoading] = useState(false);
+  const [gapError, setGapError] = useState("");
+  const [gaps, setGaps] = useState([]);
+  const [filledFromAudio, setFilledFromAudio] = useState([]);
+  const recognitionRef = useRef(null);
+  const shouldContinueRef = useRef(false);
+  const timerRef = useRef(null);
+
+  const questions = useMemo(() => (presentation ? visibleQuestions(presentation, answers) : []), [presentation, answers]);
+  const core = questions.filter((q) => q.p <= 2);
+  const answeredCount = core.filter((q) => isAnswered(q, answers)).length;
+  const pct = core.length ? Math.round((answeredCount / core.length) * 100) : 0;
+  const remaining = core.length - answeredCount;
+  const estMinutes = Math.max(1, Math.round((remaining * 22) / 60));
+  const flags = useMemo(() => computeFlags(answers), [answers]);
+  const sections = useMemo(() => (dashboardText ? parseDashboard(dashboardText) : []), [dashboardText]);
+  const selfHarmAutoTriggered = presentation !== "selfharm" && answers.recentSelfHarm === "Yes";
+
+  const setAnswer = (id, val) => setAnswers((a) => ({ ...a, [id]: val }));
+
+  const saveApiKey = (key) => {
+    setApiKey(key);
+    localStorage.setItem("opd_cdss_api_key", key);
+    setShowKeyInput(false);
+  };
+
+  const startPresentation = (id) => {
+    setPresentation(id);
+    setAnswers({});
+    setScreen("intake");
+    setDashboardText("");
+    setError("");
+    setMode("manual");
+    setTranscript("");
+    setGaps([]);
+    setFilledFromAudio([]);
+    setConsentGiven(false);
+  };
+
+  function startListening() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { setSpeechSupported(false); return; }
+    const recognition = new SR();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-IN";
+    recognition.onstart = () => setSpeechError("");
+    recognition.onresult = (event) => {
+      let finalText = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        if (event.results[i].isFinal) finalText += event.results[i][0].transcript + " ";
+      }
+      if (finalText) setTranscript((prev) => (prev ? prev + " " + finalText : finalText));
+    };
+    recognition.onerror = (event) => {
+      setSpeechError(event.error || "unknown-error");
+      if (["not-allowed", "service-not-allowed", "audio-capture"].includes(event.error)) {
+        shouldContinueRef.current = false;
+        setListening(false);
+        if (timerRef.current) clearInterval(timerRef.current);
+      }
+    };
+    recognition.onend = () => {
+      if (shouldContinueRef.current) {
+        try { recognition.start(); } catch (e) { setSpeechError("could-not-restart"); setListening(false); }
+      }
+    };
+    shouldContinueRef.current = true;
+    try { recognition.start(); } catch (e) { setSpeechError("could-not-start"); return; }
+    recognitionRef.current = recognition;
+    setListening(true);
+    setElapsed(0);
+    timerRef.current = setInterval(() => setElapsed((s) => s + 1), 1000);
+  }
+
+  function stopListening() {
+    shouldContinueRef.current = false;
+    if (recognitionRef.current) recognitionRef.current.stop();
+    setListening(false);
+    if (timerRef.current) clearInterval(timerRef.current);
+  }
+
+  async function runGapCheck() {
+    if (!transcript.trim()) return;
+    if (!apiKey) { setGapError("Add your Anthropic API key first (top of page)."); return; }
+    setGapLoading(true);
+    setGapError("");
+    try {
+      const checklist = questions.filter((q) => q.p <= 2).map((q) => ({ id: q.id, label: q.label, priority: q.p, type: q.type, options: q.opts }));
+      const system = `You are assisting a psychiatrist during a live OPD consultation. You are given a rough speech-to-text transcript of the consultation so far, and a structured checklist (priority 0 = safety-critical, 1 = diagnosis-changing, 2 = treatment-changing). The doctor wants to keep eye contact with the patient rather than look at a screen, so they need: what can already be documented from the conversation, and a short list of what to still ask.
+
+Respond in exactly this format, nothing else:
+
+EXTRACTED:
+<a single-line JSON object mapping only checklist ids you are genuinely confident about from the transcript, to a value matching that item's options exactly (for multichip items, a JSON array of exact option strings). Never guess. Omit any id you are not confident about.>
+
+STILL ASK:
+<up to 6 bullet points, each on its own line starting with "- ", listing the highest-priority not-yet-covered items, safety-critical (priority 0) items first, each phrased as a short question prompt under 10 words. If genuinely nothing important is missing, write a single bullet "- Nothing critical missing so far.">`;
+      const text = await callClaude(apiKey, system, `Checklist:\n${JSON.stringify(checklist, null, 2)}\n\nTranscript so far:\n${transcript}`);
+      const { extracted, gaps: gapList } = parseGapCheck(text);
+      const validIds = new Set(questions.map((q) => q.id));
+      const cleanExtracted = {};
+      Object.keys(extracted || {}).forEach((k) => { if (validIds.has(k)) cleanExtracted[k] = extracted[k]; });
+      setAnswers((a) => ({ ...a, ...cleanExtracted }));
+      setFilledFromAudio(questions.filter((q) => cleanExtracted[q.id] !== undefined).map((q) => q.label));
+      setGaps(gapList);
+    } catch (e) {
+      setGapError("Could not check for gaps: " + e.message);
+    } finally {
+      setGapLoading(false);
+    }
+  }
+
+  function speakGaps() {
+    if (!("speechSynthesis" in window) || gaps.length === 0) return;
+    const utterance = new SpeechSynthesisUtterance(gaps.join(". Next, "));
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(utterance);
+  }
+
+  const primaryQuestions = presentation ? ((MODULES[presentation] && MODULES[presentation].questions) || []).filter((q) => !q.showIf || q.showIf(answers)) : [];
+  const selfHarmQuestions = (presentation === "selfharm" || answers.recentSelfHarm === "Yes") ? SELFHARM.filter((q) => !q.showIf || q.showIf(answers)) : [];
+  const groups = [
+    { title: "Universal backbone", items: BACKBONE.filter((q) => !q.showIf || q.showIf(answers)) },
+    ...(presentation ? [{ title: `${MODULES[presentation].label} presentation`, items: primaryQuestions }] : []),
+    ...(selfHarmQuestions.length ? [{ title: "Self-harm / risk pathway", items: selfHarmQuestions }] : []),
+  ];
+
+  async function generateDashboard() {
+    if (!apiKey) { setError("Add your Anthropic API key first (top of page)."); return; }
+    setLoading(true); setError("");
+    try {
+      const payload = {};
+      questions.forEach((q) => { if (isAnswered(q, answers)) payload[q.label] = answers[q.id]; });
+      const system = `You are producing an extremely concise, doctor-facing clinical decision-support dashboard for a psychiatrist in an Indian OPD setting, based on structured intake data they collected during a live consultation. The clinician remains responsible for diagnosis and treatment; you are supporting, not replacing, their judgment.
+
+Output plain text (no markdown asterisks, no bold). Use these exact section headers, each alone on its own line in capitals followed by a colon, and under EVERY header write ONLY short bullet points, each on its own line starting with "- ". Never write paragraphs, never write more than one sentence per bullet. Each bullet under 12 words. This is read in seconds during a live consultation.
+
+ONLY include a header if you have real, data-grounded content for it. Skip a header entirely if it has nothing genuinely relevant to say — never write a placeholder bullet like "None reported" or "Insufficient information" just to fill a section. Fewer, sharper sections beat complete coverage.
+
+Use this order when sections apply:
+
+WORKING FORMULATION:
+RISK:
+TREATMENT CONSIDERATIONS:
+ADVICE TO PATIENT:
+DIAGNOSTIC CONSIDERATIONS:
+MISSING INFORMATION:
+INVESTIGATIONS TO CONSIDER:
+MEDICATION REVIEW:
+FOLLOW-UP / DISPOSITION:
+
+WORKING FORMULATION: 1–2 bullets maximum, the core clinical picture only.
+RISK: bullets prefixed "Acute risk:", "Chronic risk:", "Risk factor —", "Protective factor —" (low/intermediate/high/unclear, never a numeric score). Omit entirely if this presentation carries no meaningful risk dimension.
+TREATMENT CONSIDERATIONS: this is the priority section — put real, specific, actionable content here, not generic advice. Prefix each bullet "First-line —", "Adjunctive —", or "Caution —". Max 5 bullets.
+ADVICE TO PATIENT: plain-language bullets the clinician can say directly to the patient. Use this fixed structure, one bullet per line that applies — skip any line that genuinely doesn't apply, don't force all four:
+"Medication — for <specific target, e.g. mood, sleep, anxiety>" (only if medication is indicated or already prescribed)
+"Lifestyle — <specific interventions, e.g. exercise, sleep schedule, social connection, alcohol/substance reduction>" (name the ones actually relevant to this patient, not a generic list)
+"Investigations — blood tests to rule out physical contributors" (only if a medical/organic contributor is plausible from the data)
+"Therapy — continue/start therapy focused on <specific skill or target, e.g. assertiveness, safety planning, sleep hygiene>" (only if psychotherapy is indicated, and name the actual focus, not just "therapy")
+DIAGNOSTIC CONSIDERATIONS: prefix "Most likely —", "Alternative to exclude —", "High-consequence possibility —". Only list what genuinely needs stating.
+MISSING INFORMATION: max 4 bullets, only items that could change today's management.
+INVESTIGATIONS TO CONSIDER: prefix "Essential —" or "Consider —". Omit if none are indicated.
+MEDICATION REVIEW: only include if medications were actually reported.
+FOLLOW-UP / DISPOSITION: only include if it changes from routine follow-up (e.g. early review, urgent referral, inpatient consideration).
+
+Rules: never claim a patient is "safe" or "low risk" without justification from the data given; never assert a definitive diagnosis from partial information — use established / probable / possible / needs exclusion / unclear; do not invent facts not present in the data. If personality-pattern data is present, do not conclude a personality disorder from a single visit — flag it as needing longitudinal corroboration. If this is an ED/PME (sexual dysfunction) presentation, weigh organic vs. psychogenic contribution explicitly (situational vs. generalized, preserved vs. absent morning erections, vascular risk factors, medication timing) rather than defaulting to a psychological explanation, and flag medical/urology referral where indicated.`;
+      const text = await callClaude(apiKey, system, `Presentation type: ${presentation}\n\nCollected data:\n${JSON.stringify(payload, null, 2)}\n\nDetected automated flags:\n${flags.map((f) => `- [${f.level.toUpperCase()}] ${f.text}`).join("\n") || "None"}`);
+      setDashboardText(text || "No response generated.");
+      setScreen("dashboard");
+    } catch (e) {
+      setError("Could not generate the dashboard: " + e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const ApiKeyBar = React.createElement("div", { style: { background: sidebar, borderBottom: "1px solid " + sidebarLine, padding: "8px 16px", display: "flex", alignItems: "center", gap: 8 } },
+    !showKeyInput
+      ? React.createElement(React.Fragment, null,
+          React.createElement("span", { style: { color: "rgba(255,255,255,0.5)", fontSize: 12 } }, "API key saved locally on this device"),
+          React.createElement("button", { onClick: () => setShowKeyInput(true), style: { color: "#fff", background: "transparent", border: "1px solid " + sidebarLine, padding: "3px 8px", fontSize: 12 } }, "Change")
+        )
+      : React.createElement(React.Fragment, null,
+          React.createElement("input", {
+            type: "password", placeholder: "sk-ant-... (Anthropic API key)", defaultValue: apiKey,
+            id: "apiKeyInput",
+            style: { flex: 1, maxWidth: 360, padding: "5px 8px", fontSize: 12, border: "1px solid " + sidebarLine, background: "#fff" },
+          }),
+          React.createElement("button", {
+            onClick: () => saveApiKey(document.getElementById("apiKeyInput").value.trim()),
+            style: { background: accent, color: "#fff", border: "none", padding: "5px 10px", fontSize: 12 },
+          }, "Save"),
+          React.createElement("span", { style: { color: "rgba(255,255,255,0.4)", fontSize: 11 } }, "Stored only in this browser's local storage — never sent anywhere but api.anthropic.com")
+        )
+  );
+
+  return React.createElement("div", { style: { background: paper, color: ink, minHeight: "100vh" } },
+    ApiKeyBar,
+    React.createElement("div", { style: { display: "flex", minHeight: "calc(100vh - 41px)" } },
+      React.createElement("div", { style: { background: sidebar, borderRight: "1px solid " + sidebarLine, width: 220, flexShrink: 0, display: "flex", flexDirection: "column" } },
+        React.createElement("div", { style: { borderBottom: "1px solid " + sidebarLine, padding: "16px" } },
+          React.createElement("div", { style: { fontSize: 11, color: "rgba(255,255,255,0.5)" } }, "Psychiatric OPD"),
+          React.createElement("div", { style: { color: "#fff", fontSize: 15, marginTop: 2 } }, "Assessment support")
+        ),
+        screen !== "select" && React.createElement(React.Fragment, null,
+          React.createElement("div", { style: { padding: "12px 16px", borderBottom: "1px solid " + sidebarLine } },
+            React.createElement("button", {
+              onClick: () => { if (listening) stopListening(); setScreen("select"); },
+              style: { color: "rgba(255,255,255,0.6)", background: "transparent", border: "none", fontSize: 12, cursor: "pointer" },
+            }, "← Change presentation")
+          ),
+          React.createElement("div", { style: { padding: "12px 16px", borderBottom: "1px solid " + sidebarLine } },
+            React.createElement("div", { style: { color: "rgba(255,255,255,0.5)", fontSize: 11, marginBottom: 4 } }, "Core assessment"),
+            React.createElement("div", { style: { display: "flex", alignItems: "baseline", gap: 8 } },
+              React.createElement("span", { style: { color: "#fff", fontSize: 20 } }, pct + "%"),
+              React.createElement("span", { style: { color: "rgba(255,255,255,0.4)", fontSize: 12 } }, "complete")
+            ),
+            React.createElement("div", { style: { height: 3, width: "100%", background: "rgba(255,255,255,0.1)", marginTop: 8 } },
+              React.createElement("div", { style: { width: pct + "%", background: accent, height: "100%" } })
+            ),
+            React.createElement("div", { style: { color: "rgba(255,255,255,0.5)", fontSize: 12, marginTop: 8 } }, `~${estMinutes} min remaining`)
+          ),
+          React.createElement("div", { style: { padding: "12px 16px", flex: 1, overflow: "auto" } },
+            React.createElement("div", { style: { color: "rgba(255,255,255,0.5)", fontSize: 11, marginBottom: 6 } }, `Red flags ${flags.length ? "(" + flags.length + ")" : ""}`),
+            flags.length === 0 && React.createElement("div", { style: { color: "rgba(255,255,255,0.3)", fontSize: 12 } }, "None detected yet"),
+            React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 6 } },
+              flags.map((f, i) => React.createElement("div", { key: i, style: { display: "flex", gap: 6, fontSize: 12, color: "rgba(255,255,255,0.8)" } },
+                React.createElement("span", { style: { color: f.level === "critical" ? "#F0837A" : "#E0B25C" } }, "!"),
+                React.createElement("span", null, f.text)
+              ))
+            )
+          )
+        )
+      ),
+      React.createElement("div", { style: { flex: 1, overflow: "auto" } },
+
+        screen === "select" && React.createElement("div", { style: { maxWidth: 640, margin: "0 auto", padding: "56px 32px" } },
+          React.createElement("h1", { style: { fontSize: 22, marginBottom: 4 } }, "Select presentation"),
+          React.createElement("p", { style: { color: "rgba(0,0,0,0.5)", fontSize: 13, marginBottom: 32 } }, "Choose the module for this consultation. The self-harm pathway activates automatically within any module if indicated."),
+          React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+            PRESENTATIONS.map((id) => React.createElement("button", {
+              key: id, onClick: () => startPresentation(id),
+              style: { border: "1px solid " + line, background: panel, padding: "12px 16px", textAlign: "left", display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 14 },
+            }, MODULES[id].label, React.createElement("span", { style: { color: "rgba(0,0,0,0.4)" } }, "›")))
+          )
+        ),
+
+        screen === "intake" && React.createElement("div", { style: { maxWidth: 640, margin: "0 auto", padding: "40px 32px 96px" } },
+          React.createElement("div", { style: { display: "flex", gap: 8, marginBottom: 28 } },
+            React.createElement("button", { onClick: () => setMode("manual"), style: { border: "1px solid " + (mode === "manual" ? accent : line), background: mode === "manual" ? accent : "transparent", color: mode === "manual" ? "#fff" : ink, padding: "6px 12px", fontSize: 13 } }, "Manual entry"),
+            React.createElement("button", { onClick: () => setMode("listen"), style: { border: "1px solid " + (mode === "listen" ? accent : line), background: mode === "listen" ? accent : "transparent", color: mode === "listen" ? "#fff" : ink, padding: "6px 12px", fontSize: 13 } }, "Live listening")
+          ),
+
+          mode === "listen" && React.createElement("div", { style: { marginBottom: 32 } },
+            !consentGiven
+              ? React.createElement("div", { style: { border: "1px solid " + line, background: panel, padding: 16 } },
+                  React.createElement("div", { style: { fontSize: 14, marginBottom: 8 } }, "Before you start recording"),
+                  React.createElement("p", { style: { color: "rgba(0,0,0,0.6)", fontSize: 13, marginBottom: 8, lineHeight: 1.5 } }, "Live transcription uses your browser's built-in speech recognition, which sends audio to your browser vendor's servers (e.g. Google, for Chrome) to convert to text. The transcript is then sent to Claude when you tap \"Check what's missing.\" Nothing is saved anywhere except your API key, stored only on this device — the transcript exists only in this browser tab and is gone when you close or refresh it."),
+                  React.createElement("p", { style: { color: "rgba(0,0,0,0.6)", fontSize: 13, marginBottom: 12, lineHeight: 1.5 } }, "Make sure your patient is aware their conversation is being transcribed for note-taking, and is comfortable with that, before you begin."),
+                  React.createElement("label", { style: { display: "flex", gap: 8, fontSize: 13, marginBottom: 12, alignItems: "flex-start" } },
+                    React.createElement("input", { type: "checkbox", checked: consentGiven, onChange: (e) => setConsentGiven(e.target.checked), style: { marginTop: 2 } }),
+                    React.createElement("span", null, "Patient has been informed and is comfortable with audio-assisted note-taking for this consultation.")
+                  )
+                )
+              : React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 16 } },
+                  React.createElement("div", { style: { border: "1px solid " + line, background: panel, padding: 16, display: "flex", justifyContent: "space-between", alignItems: "center" } },
+                    React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12 } },
+                      React.createElement("button", {
+                        onClick: listening ? stopListening : startListening,
+                        style: { background: listening ? critical : accent, color: "#fff", width: 36, height: 36, border: "none", fontSize: 12 },
+                      }, listening ? "Stop" : "● Rec"),
+                      React.createElement("div", null,
+                        React.createElement("div", { style: { fontSize: 13 } }, listening ? "Listening…" : "Not listening"),
+                        listening && React.createElement("div", { style: { color: "rgba(0,0,0,0.4)", fontSize: 11 } }, `${String(Math.floor(elapsed / 60)).padStart(2, "0")}:${String(elapsed % 60).padStart(2, "0")}`)
+                      )
+                    ),
+                    React.createElement("button", {
+                      onClick: runGapCheck, disabled: gapLoading || !transcript.trim(),
+                      style: { background: accent, color: "#fff", border: "none", padding: "8px 12px", fontSize: 13, opacity: (gapLoading || !transcript.trim()) ? 0.4 : 1 },
+                    }, gapLoading ? "Checking…" : "Check what's missing")
+                  ),
+                  !speechSupported && React.createElement("div", { style: { border: "1px solid " + moderate, background: "#FBF6E9", padding: "8px 12px", fontSize: 13 } },
+                    "Live transcription isn't available in this browser. Type or paste notes below instead — dictating into this box using your phone's keyboard microphone works well too."
+                  ),
+                  speechError && React.createElement("div", { style: { border: "1px solid " + moderate, background: "#FBF6E9", padding: "8px 12px", fontSize: 13, lineHeight: 1.5 } },
+                    ["not-allowed", "service-not-allowed", "audio-capture"].includes(speechError)
+                      ? "Microphone access was blocked. Check your browser's site permissions (click the padlock/icon in the address bar) and allow microphone access, then try again. You can also type or paste notes below in the meantime."
+                      : `Microphone error: ${speechError}. Use the text box below instead.`
+                  ),
+                  React.createElement("textarea", {
+                    value: transcript, onChange: (e) => setTranscript(e.target.value),
+                    placeholder: "Transcript will appear here as you talk — or type/paste notes directly.",
+                    rows: 5, style: { width: "100%", border: "1px solid " + line, padding: "8px 12px", fontSize: 13, outline: "none" },
+                  }),
+                  gapError && React.createElement("div", { style: { color: critical, fontSize: 13 } }, gapError),
+                  filledFromAudio.length > 0 && React.createElement("div", { style: { color: "rgba(0,0,0,0.4)", fontSize: 12 } }, `Picked up from the conversation: ${filledFromAudio.join(", ")}. Switch to Manual entry to review or correct.`),
+                  gaps.length > 0 && React.createElement("div", { style: { border: "2px solid " + critical, padding: 16 } },
+                    React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 8 } },
+                      React.createElement("div", { style: { color: critical, fontSize: 12 } }, "Still ask about"),
+                      React.createElement("button", { onClick: speakGaps, style: { background: "transparent", border: "none", color: "rgba(0,0,0,0.5)", fontSize: 12, cursor: "pointer" } }, "🔊 Read aloud")
+                    ),
+                    React.createElement("ul", { style: { margin: 0, padding: 0, listStyle: "none", display: "flex", flexDirection: "column", gap: 6 } },
+                      gaps.map((g, i) => React.createElement("li", { key: i, style: { display: "flex", gap: 8, fontSize: 14 } },
+                        React.createElement("span", { style: { color: critical } }, "—"),
+                        React.createElement("span", null, g)
+                      ))
+                    )
+                  )
+                )
+          ),
+
+          selfHarmAutoTriggered && React.createElement("div", { style: { border: "1px solid " + critical, background: "#FBEDEA", padding: "8px 12px", marginBottom: 24, fontSize: 13 } }, "Self-harm pathway activated based on your answer above."),
+
+          mode === "manual" && groups.map((g) => React.createElement("div", { key: g.title, style: { marginBottom: 32 } },
+            React.createElement("div", { style: { fontSize: 12, color: "rgba(0,0,0,0.4)", marginBottom: 12 } }, g.title),
+            React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 20 } },
+              g.items.map((q) => React.createElement("div", { key: q.id },
+                React.createElement("div", { style: { display: "flex", alignItems: "flex-start", gap: 6, marginBottom: 6 } },
+                  React.createElement("span", { style: { color: isAnswered(q, answers) ? accent : "rgba(0,0,0,0.2)", fontSize: 14 } }, isAnswered(q, answers) ? "●" : "○"),
+                  React.createElement("span", { style: { fontSize: 14 } }, q.label),
+                  q.p === 0 && React.createElement("span", { style: { color: critical, fontSize: 11, marginLeft: 4 } }, "safety")
+                ),
+                React.createElement("div", { style: { paddingLeft: 20 } }, React.createElement(QuestionField, { q, value: answers[q.id], onChange: setAnswer }))
+              ))
+            )
+          )),
+
+          React.createElement("div", { style: { position: "sticky", bottom: 0, paddingTop: 16, background: paper } },
+            error && React.createElement("div", { style: { color: critical, fontSize: 13, marginBottom: 8 } }, error),
+            React.createElement("button", {
+              onClick: generateDashboard, disabled: loading || answeredCount === 0,
+              style: { background: accent, color: "#fff", border: "none", padding: "10px 16px", fontSize: 14, opacity: (loading || answeredCount === 0) ? 0.5 : 1 },
+            }, loading ? React.createElement("span", { className: "spin" }, "⟳") : null, " ", loading ? "Generating..." : "Generate assessment")
+          )
+        ),
+
+        screen === "dashboard" && React.createElement("div", { style: { maxWidth: 640, margin: "0 auto", padding: "40px 32px" } },
+          React.createElement("button", { onClick: () => setScreen("intake"), style: { background: "none", border: "none", color: "rgba(0,0,0,0.5)", fontSize: 13, marginBottom: 24, cursor: "pointer" } }, "← Back to intake"),
+          React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 20 } },
+            sections.map((s, i) => {
+              const isTreatment = s.header === "TREATMENT CONSIDERATIONS";
+              const isAdvice = s.header === "ADVICE TO PATIENT";
+              const highlighted = isTreatment || isAdvice;
+              return React.createElement("div", {
+                key: i,
+                style: { background: isAdvice ? "#FBF6E9" : panel, border: (highlighted ? "2px" : "1px") + " solid " + (isTreatment ? accent : isAdvice ? "#C79A2E" : line) },
+              },
+                s.header && React.createElement("div", {
+                  style: { borderBottom: "1px solid " + (isAdvice ? "#C79A2E" : line), background: isTreatment ? accent : "transparent", color: isTreatment ? "#fff" : isAdvice ? "#8A6414" : accent, padding: "8px 16px", fontSize: 12 },
+                }, s.header),
+                React.createElement("ul", { style: { margin: 0, padding: "12px 16px", listStyle: "none", display: "flex", flexDirection: "column", gap: 6 } },
+                  s.bullets.map((b, j) => React.createElement("li", { key: j, style: { display: "flex", gap: 8, fontSize: 13.5 } },
+                    React.createElement("span", { style: { color: isAdvice ? "#8A6414" : accent } }, "—"),
+                    React.createElement("span", null, b)
+                  ))
+                )
+              );
+            })
+          ),
+          React.createElement("div", { style: { color: "rgba(0,0,0,0.4)", fontSize: 11, marginTop: 16 } }, "Decision support only. Does not replace clinical judgment. Verify before acting on any suggestion.")
+        )
+      )
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
